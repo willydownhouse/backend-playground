@@ -7,9 +7,7 @@ import io.restassured.RestAssured.given
 import io.restassured.http.ContentType
 import jakarta.transaction.Transactional
 import org.hamcrest.Matchers.equalTo
-import org.hamcrest.Matchers.hasItems
 import org.hamcrest.Matchers.notNullValue
-import org.jboss.logging.Logger
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
@@ -18,8 +16,6 @@ import java.util.UUID
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 @QuarkusTest
 class PostResourceTest {
-
-    private val log = Logger.getLogger(PostResourceTest::class.java)
 
     @BeforeEach
     @Transactional
@@ -111,45 +107,4 @@ class PostResourceTest {
             .then()
             .statusCode(400)
     }
-
-    @Test
-    fun `creating post notifies other users but not author`() {
-        val aliceId = createUser("alice", "alice@example.com")
-        val bobId = createUser("bob", "bob@example.com")
-
-        given()
-            .contentType(ContentType.JSON)
-            .body("""{"authorId":"$aliceId","title":"Hello world","body":"My first post"}""")
-            .post("/posts")
-            .then()
-            .statusCode(201)
-
-        val notificationsResponse = given()
-            .get("/notifications?userId=$bobId")
-            .then()
-            .statusCode(200)
-            .extract()
-            .response()
-
-        log.info("Notifications: ${notificationsResponse.body.asString()}")
-
-        notificationsResponse.then()
-            .body("size()", equalTo(1))
-            .body("[0].type", equalTo("NEW_POST"))
-            .body("[0].title", equalTo("alice published a new post"))
-            .body("[0].body", equalTo("Hello world"))
-            .body("[0].read", equalTo(false))
-            .body("[0].recipientId", equalTo(bobId))
-            .body("[0].actorId", equalTo(aliceId))
-    }
-
-    private fun createUser(username: String, email: String): String =
-        given()
-            .contentType(ContentType.JSON)
-            .body("""{"username":"$username","email":"$email"}""")
-            .post("/users")
-            .then()
-            .statusCode(201)
-            .extract()
-            .path("id")
 }

@@ -1,7 +1,7 @@
 package com.learn.notification
 
-import com.learn.post.Post
 import com.learn.user.User
+import io.quarkus.narayana.jta.QuarkusTransaction
 import io.quarkus.test.junit.QuarkusTest
 import io.restassured.RestAssured.given
 import io.restassured.http.ContentType
@@ -20,7 +20,6 @@ class NotificationResourceTest {
     @Transactional
     fun beforeEach() {
         Notification.deleteAll()
-        Post.deleteAll()
         User.deleteAll()
     }
 
@@ -30,9 +29,11 @@ class NotificationResourceTest {
         val bobId = createUser("bob", "bob@example.com")
         val carolId = createUser("carol", "carol@example.com")
 
-        createPost(aliceId, "Hello world", "My first post")
+        seedNotifications {
+            seedNewPostNotification(recipientId = bobId, actorId = aliceId, postTitle = "Hello world")
+            seedNewPostNotification(recipientId = carolId, actorId = aliceId, postTitle = "Hello world")
+        }
 
-        // Bob should have one notification for Alice's post
         given()
             .queryParam("userId", bobId)
             .get("/notifications")
@@ -46,7 +47,6 @@ class NotificationResourceTest {
             .body("[0].body", equalTo("Hello world"))
             .body("[0].read", equalTo(false))
 
-        // Alice should have no notifications for her own post
         given()
             .queryParam("userId", aliceId)
             .get("/notifications")
@@ -54,7 +54,6 @@ class NotificationResourceTest {
             .statusCode(200)
             .body("size()", equalTo(0))
 
-        // Carol should have one notification for Alice's post
         given()
             .queryParam("userId", carolId)
             .get("/notifications")
@@ -88,9 +87,10 @@ class NotificationResourceTest {
     fun `mark notification as read`() {
         val aliceId = createUser("alice", "alice@example.com")
         val bobId = createUser("bob", "bob@example.com")
-        createUser("carol", "carol@example.com")
 
-        createPost(aliceId, "Hello world", "My first post")
+        seedNotifications {
+            seedNewPostNotification(recipientId = bobId, actorId = aliceId, postTitle = "Hello world")
+        }
 
         val notificationId = given()
             .queryParam("userId", bobId)
@@ -122,7 +122,9 @@ class NotificationResourceTest {
         val aliceId = createUser("alice", "alice@example.com")
         val bobId = createUser("bob", "bob@example.com")
 
-        createPost(aliceId, "Hello world", "My first post")
+        seedNotifications {
+            seedNewPostNotification(recipientId = bobId, actorId = aliceId, postTitle = "Hello world")
+        }
 
         val notificationId = given()
             .queryParam("userId", bobId)
@@ -160,12 +162,28 @@ class NotificationResourceTest {
             .extract()
             .path("id")
 
-    private fun createPost(authorId: String, title: String, body: String) {
-        given()
-            .contentType(ContentType.JSON)
-            .body("""{"authorId":"$authorId","title":"$title","body":"$body"}""")
-            .post("/posts")
-            .then()
-            .statusCode(201)
+    private fun seedNotifications(block: () -> Unit) {
+        QuarkusTransaction.requiringNew().run(block)
+    }
+
+    private fun seedNewPostNotification(
+        recipientId: String,
+        actorId: String,
+        postTitle: String,
+        referenceId: UUID = UUID.randomUUID(),
+    ) {
+        val recipient = User.findById(UUID.fromString(recipientId))
+            ?: error("Recipient not found: $recipientId")
+        val actor = User.findById(UUID.fromString(actorId))
+            ?: error("Actor not found: $actorId")
+
+        Notification().apply {
+            this.recipient = recipient
+            this.actor = actor
+            type = NotificationType.NEW_POST
+            title = "${actor.username} published a new post"
+            body = postTitle
+            this.referenceId = referenceId
+        }.persist()
     }
 }

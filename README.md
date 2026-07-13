@@ -4,6 +4,52 @@ This project uses Quarkus, the Supersonic Subatomic Java Framework.
 
 If you want to learn more about Quarkus, please visit its website: <https://quarkus.io/>.
 
+## Running Kafka locally
+
+The app publishes `PostCreatedEvent` messages to Kafka. Start Kafka before running the application in dev mode.
+
+If the container already exists but is stopped:
+
+```shell script
+docker start kafka
+```
+
+Check that it is running:
+
+```shell script
+docker ps
+```
+
+If you need to create it fresh, remove any old container first:
+
+```shell script
+docker rm -f kafka
+```
+
+Then run:
+
+```shell script
+docker run -d \
+  --name kafka \
+  -p 9092:9092 \
+  -e KAFKA_CFG_NODE_ID=0 \
+  -e KAFKA_CFG_PROCESS_ROLES=controller,broker \
+  -e KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 \
+  -e KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092 \
+  -e KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
+  -e KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=0@localhost:9093 \
+  -e KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER \
+  bitnami/kafka
+```
+
+The app connects to **`localhost:9092`**.
+
+If something looks wrong, check the logs:
+
+```shell script
+docker logs kafka
+```
+
 ## Running the application in dev mode
 
 You can run your application in dev mode that enables live coding using:
