@@ -5,11 +5,17 @@ import com.learn.user.User
 import io.smallrye.common.annotation.Blocking
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.transaction.Transactional
+import org.eclipse.microprofile.reactive.messaging.Channel
+import org.eclipse.microprofile.reactive.messaging.Emitter
 import org.eclipse.microprofile.reactive.messaging.Incoming
 import org.jboss.logging.Logger
+import java.time.Instant
 
 @ApplicationScoped
-class PostCreatedConsumer {
+class PostCreatedConsumer(
+    @Channel("post-created-dlq-out")
+    private val deadLetterEmitter: Emitter<PostCreatedDeadLetter>,
+) {
 
     private val log = Logger.getLogger(PostCreatedConsumer::class.java)
 
@@ -19,7 +25,18 @@ class PostCreatedConsumer {
     fun consume(event: PostCreatedEvent) {
         val author = User.findById(event.authorId)
         if (author == null) {
-            log.warn("Skipping fan-out: author not found authorId=${event.authorId}")
+            deadLetterEmitter.send(
+                PostCreatedDeadLetter(
+                    originalEvent = event,
+                    reason = DeadLetterReason.AUTHOR_NOT_FOUND,
+                    failedAt = Instant.now(),
+                    sourceTopic = PostCreatedDeadLetter.SOURCE_TOPIC,
+                ),
+            )
+
+            log.warn(
+                "Sent dead letter for post id=${event.postId} authorId=${event.authorId} reason=${DeadLetterReason.AUTHOR_NOT_FOUND}",
+            )
             return
         }
 

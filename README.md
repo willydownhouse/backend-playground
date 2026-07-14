@@ -50,6 +50,72 @@ If something looks wrong, check the logs:
 docker logs kafka
 ```
 
+### Inspecting topics and messages
+
+Topics live **inside the Kafka broker** (the `kafka` container). They are created automatically when the app first publishes to them. This project uses:
+
+| Topic | Purpose |
+|-------|---------|
+| `post-created` | Main event stream when a post is created |
+| `post-created-dlq` | Dead-letter queue for events that could not be processed |
+
+List all topics:
+
+```shell script
+docker exec kafka kafka-topics.sh --bootstrap-server localhost:9092 --list
+```
+
+Describe a topic (partitions, replicas):
+
+```shell script
+docker exec kafka kafka-topics.sh --bootstrap-server localhost:9092 --describe --topic post-created
+```
+
+Read messages from a topic (prints JSON payloads; `Ctrl+C` to stop):
+
+```shell script
+docker exec -it kafka kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 \
+  --topic post-created \
+  --from-beginning
+```
+
+Read only the latest messages (useful if the topic already has old data):
+
+```shell script
+docker exec -it kafka kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 \
+  --topic post-created
+```
+
+Read a limited number of messages from the DLQ:
+
+```shell script
+docker exec -it kafka kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 \
+  --topic post-created-dlq \
+  --from-beginning \
+  --max-messages 10
+```
+
+Delete a topic (removes all messages; the topic is recreated automatically on next publish):
+
+```shell script
+docker exec kafka kafka-topics.sh \
+  --bootstrap-server localhost:9092 \
+  --delete \
+  --topic post-created-dlq
+```
+
+Delete both project topics (one command per topic):
+
+```shell script
+docker exec kafka kafka-topics.sh --bootstrap-server localhost:9092 --delete --topic post-created
+docker exec kafka kafka-topics.sh --bootstrap-server localhost:9092 --delete --topic post-created-dlq
+```
+
+> **Note:** Run these commands on your host machine; `docker exec` runs the Kafka CLI **inside** the container where the broker and topics live. The app connects from outside via `localhost:9092`.
+
 ## Running the application in dev mode
 
 You can run your application in dev mode that enables live coding using:

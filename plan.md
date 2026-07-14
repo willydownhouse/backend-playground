@@ -126,17 +126,22 @@ It gives you a **concrete trigger event** (`PostCreated`) instead of abstract �
 
 ---
 
-### Step 1 — In-app notifications for new posts (current focus)
+### Step 1 — In-app notifications for new posts ✅ complete
 
-**Goal:** When a post is created, persist in-app notification rows for other users. No email, no queue yet.
+**Goal:** When a post is created, persist in-app notification rows for other users.
 
-**Architecture (synchronous, single service):**
+**Architecture (implemented — async via Kafka):**
 
 ```
-POST /posts  →  save Post  →  NotificationService  →  save Notification rows  →  return Post
+POST /posts  →  save Post  →  publish PostCreatedEvent  →  Kafka (post-created)
+                                                              ↓
+                                                    PostCreatedConsumer  →  save Notification rows
+
 GET /notifications?userId=  →  list unread/read notifications for that user
 PATCH /notifications/{id}/read  →  mark one as read
 ```
+
+> **Note:** Step 1 originally planned synchronous fan-out in `NotificationService`. The implementation uses Kafka early (Level 2 preview). Fan-out runs in `PostCreatedConsumer`; `NotificationService` publishes the event.
 
 #### Data model
 
@@ -218,17 +223,18 @@ GET /notifications?userId=uuid-of-bob
 ```
 com.learn
   user/
-    User.kt              -- Panache entity
-    UserResource.kt      -- REST
+    User.kt, UserResource.kt, UserDtos.kt
   post/
-    Post.kt
-    CreatePostRequest.kt -- DTO + validation
-    PostResource.kt
+    Post.kt, PostResource.kt, PostDtos.kt, PostCreatedEvent.kt
   notification/
-    Notification.kt
-    NotificationType.kt  -- enum: NEW_POST
-    NotificationService.kt   -- fan-out logic (@ApplicationScoped)
-    NotificationResource.kt
+    Notification.kt, NotificationType.kt
+    NotificationService.kt      -- publishes PostCreatedEvent to Kafka
+    PostCreatedConsumer.kt      -- fan-out logic (Kafka consumer)
+    PostCreatedDeadLetter.kt    -- DLQ payload wrapper
+    DeadLetterReason.kt         -- enum: AUTHOR_NOT_FOUND, ...
+    NotificationResource.kt, NotificationDtos.kt
+  dev/
+    DevDataSeeder.kt              -- seeds users in dev profile
 ```
 
 **Key learning moment:** keep fan-out logic in `NotificationService`, not inside the REST resource. The resource handles HTTP; the service handles business rules. Same pattern you’ll reuse when a queue replaces direct calls in Level 2.
@@ -268,34 +274,120 @@ Wrap post creation + notification inserts in a **single transaction** (`@Transac
 | Authentication | Adds complexity; use raw `userId` for now |
 | Followers / audience rules | Step 4+ (preferences & targeting) |
 | Email / push delivery | Level 1 Step 5–6 |
-| Message queue | Level 2 |
-| Idempotency / dedup | Level 2–3 |
+| Message queue | Level 2 ✅ (Kafka in use) |
+| Idempotency / dedup | Step 2b ← *next* |
+| Retry / exception DLQ | Step 2c |
 | Pagination | Add when inbox queries get slow |
 
 #### Definition of done
 
-- [ ] Can seed 2–3 users via API
-- [ ] Creating a post creates `N-1` notification rows
-- [ ] Author does **not** receive a notification for their own post
-- [ ] User can list their notifications
-- [ ] User can mark a notification as read
-- [ ] Access log shows requests in dev terminal
+- [x] Can seed 2–3 users via API
+- [x] Creating a post creates `N-1` notification rows
+- [x] Author does **not** receive a notification for their own post
+- [x] User can list their notifications
+- [x] User can mark a notification as read
+- [x] Access log shows requests in dev terminal
 
 #### Suggested build order (one PR-sized chunk at a time)
 
-1. `User` entity + `POST/GET /users` — learn Panache basics
-2. `Post` entity + `POST /posts` — no notifications yet
-3. `Notification` entity + `NotificationService` — wire into post creation
-4. `GET /notifications` + `PATCH .../read` — complete the inbox
-5. Seed script or test data — make manual testing easy
+1. ~~`User` entity + `POST/GET /users`~~ ✅
+2. ~~`Post` entity + `POST/GET /posts`~~ ✅
+3. ~~`Notification` entity + fan-out on post creation~~ ✅ (via Kafka consumer)
+4. ~~`GET /notifications` + `PATCH .../read`~~ ✅
+5. ~~Seed script or test data~~ ✅ (`DevDataSeeder` in dev)
+
+---
+
+### Step 2 — Consumer reliability: idempotency, retry, and DLQ ← *you are here*
+
+**Goal:** Make `PostCreatedConsumer` production-safe: safe retries, no duplicate notifications, failed messages preserved.
+
+**Current architecture:**
+
+```
+post-created  →  PostCreatedConsumer
+                   ├─ author found     → fan-out notifications
+                   └─ author missing   → publish to post-created-dlq (reason: AUTHOR_NOT_FOUND)
+```
+
+**Kafka topics:**
+
+| Topic | Purpose |
+|-------|---------|
+| `post-created` | Main event stream |
+| `post-created-dlq` | Unprocessable or failed events |
+
+#### What’s done (Step 2a)
+
+- [x] Kafka producer on post creation (`NotificationService` → `post-created`)
+- [x] Kafka consumer for fan-out (`PostCreatedConsumer`)
+- [x] Business-rule DLQ: `author == null` → `PostCreatedDeadLetter` on `post-created-dlq`
+- [x] `PostCreatedDeadLetter` DTO + `DeadLetterReason` enum
+- [x] README: Kafka setup, inspect topics/messages, delete topics
+
+#### Next up (recommended order)
+
+**Step 2b — Idempotency** *(do before or with retry)*
+
+Problem: Kafka delivers at-least-once. If the consumer commits DB rows but crashes before acking the offset, redelivery creates **duplicate notifications**.
+
+```
+onPostCreated(event):
+  for user in otherUsers:
+    if notification already exists(recipient, referenceId, type):
+      skip
+    else:
+      persist notification
+```
+
+Options:
+- Check-before-insert in consumer
+- Unique DB constraint on `(recipient_id, reference_id, type)` + handle duplicate gracefully
+
+Definition of done:
+- [ ] Reprocessing the same `PostCreatedEvent` does not create duplicate notification rows
+- [ ] Fan-out is safe to run multiple times for the same event
+
+**Step 2c — Retry with backoff**
+
+Problem: transient failures (DB down, connection timeout) should retry; permanent failures should not loop forever.
+
+```
+Message arrives → try process
+  → fail (exception)
+  → retry with backoff (e.g. 1s, 2s, 4s)
+  → still failing after N attempts
+  → send to DLQ (reason: e.g. PROCESSING_FAILED)
+  → ack and move on
+```
+
+Likely approach: SmallRye Kafka `failure-strategy` + retry config on `post-created-in` channel (separate from the explicit `author == null` DLQ path).
+
+Definition of done:
+- [ ] Transient DB errors are retried automatically (capped, with backoff)
+- [ ] After max retries, message lands in `post-created-dlq` with failure metadata
+- [ ] Consumer keeps processing subsequent messages (no poison-pill blocking)
+
+**Step 2d — Optional polish**
+
+- [ ] Expand `DeadLetterReason` (`PROCESSING_FAILED`, `MAX_RETRIES_EXCEEDED`, …)
+- [ ] DLQ inspection / replay notes in README
+- [ ] Tests for idempotency and retry paths
+
+#### What you learn in Step 2
+
+* At-least-once delivery and why idempotency matters
+* Retry vs skip vs DLQ (transient vs permanent vs business-rule failures)
+* Kafka topic patterns (main + DLQ)
+* Transaction boundaries in async consumers (`@Transactional` rolls back mid-loop failures, but not post-commit redelivery)
 
 ---
 
 ### Level 1 (Basic) — full scope
 
-* REST API (Quarkus + Kotlin) ✅ started
-* PostgreSQL + Panache
-* **Step 1:** In-app notifications on new post ← *you are here*
+* REST API (Quarkus + Kotlin) ✅
+* PostgreSQL + Panache ✅
+* **Step 1:** In-app notifications on new post ✅
 * User notification preferences (opt out of NEW_POST)
 * Email notifications for new posts
 * Fake → real email provider
@@ -304,13 +396,19 @@ Wrap post creation + notification inserts in a **single transaction** (`@Transac
 
 ### Level 2 (Intermediate)
 
-* Message queue (RabbitMQ / Kafka)
-* Worker service
-* Retry logic
-* Docker setup
+* Message queue (Kafka) ✅ started
+* Consumer in same app (`PostCreatedConsumer`) ✅
+* Business-rule DLQ (`author == null`) ✅
+* **Step 2b:** Idempotency ← *next*
+* **Step 2c:** Retry logic + exception DLQ
+* Separate worker service (optional split later)
+* Docker setup ✅ (Kafka via `docker run`; see README)
 
 Architecture:
-API → DB → Queue → Worker → Email provider
+```
+API → DB → Kafka (post-created) → Consumer → notifications DB
+                                      └→ DLQ (post-created-dlq) on failure
+```
 
 ---
 
@@ -318,9 +416,9 @@ API → DB → Queue → Worker → Email provider
 
 * OAuth2 authentication
 * Rate limiting
-* Idempotency keys
+* Idempotency keys (API-level; consumer dedup covered in Step 2b)
 * Kubernetes deployment
-* Monitoring & alerting
+* Monitoring & alerting (DLQ depth, consumer lag)
 * Distributed tracing
 
 ---
