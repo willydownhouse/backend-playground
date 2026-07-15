@@ -109,6 +109,8 @@ Created → Queued → Processing → Sent → Failed
 
 ## Suggested Implementation Levels
 
+**Project status (learning goals):** Steps 1–2 complete. Core notification pipeline with Kafka, idempotency, retry, and DLQ is implemented and manually verified. Optional next steps: Level 1 email/preferences, Level 2d polish, Level 3.
+
 ### Domain scenario: Posts
 
 **Trigger:** A user creates a post → other users should be notified.
@@ -229,9 +231,10 @@ com.learn
   notification/
     Notification.kt, NotificationType.kt
     NotificationService.kt      -- publishes PostCreatedEvent to Kafka
-    PostCreatedConsumer.kt      -- fan-out logic (Kafka consumer)
+    PostCreatedConsumer.kt      -- fan-out, @Retry, business DLQ
+    NotificationPersister.kt    -- idempotent per-recipient inserts
     PostCreatedDeadLetter.kt    -- DLQ payload wrapper
-    DeadLetterReason.kt         -- enum: AUTHOR_NOT_FOUND, ...
+    DeadLetterReason.kt         -- enum: AUTHOR_NOT_FOUND
     NotificationResource.kt, NotificationDtos.kt
   dev/
     DevDataSeeder.kt              -- seeds users in dev profile
@@ -275,8 +278,8 @@ Wrap post creation + notification inserts in a **single transaction** (`@Transac
 | Followers / audience rules | Step 4+ (preferences & targeting) |
 | Email / push delivery | Level 1 Step 5–6 |
 | Message queue | Level 2 ✅ (Kafka in use) |
-| Idempotency / dedup | Step 2b ← *next* |
-| Retry / exception DLQ | Step 2c |
+| Idempotency / dedup | Step 2b ✅ |
+| Retry / exception DLQ | Step 2c ✅ |
 | Pagination | Add when inbox queries get slow |
 
 #### Definition of done
@@ -298,16 +301,18 @@ Wrap post creation + notification inserts in a **single transaction** (`@Transac
 
 ---
 
-### Step 2 — Consumer reliability: idempotency, retry, and DLQ ← *you are here*
+### Step 2 — Consumer reliability: idempotency, retry, and DLQ ✅ complete
 
 **Goal:** Make `PostCreatedConsumer` production-safe: safe retries, no duplicate notifications, failed messages preserved.
 
-**Current architecture:**
+**Architecture (implemented):**
 
 ```
 post-created  →  PostCreatedConsumer
-                   ├─ author found     → fan-out notifications
-                   └─ author missing   → publish to post-created-dlq (reason: AUTHOR_NOT_FOUND)
+                   ├─ author found     → idempotent fan-out (unique constraint)
+                   │                     └─ throw (transient) → @Retry + exponential backoff
+                   │                                          └─ exhausted → post-created-dlq (framework)
+                   └─ author missing   → PostCreatedDeadLetter → post-created-dlq (manual)
 ```
 
 **Kafka topics:**
@@ -315,71 +320,45 @@ post-created  →  PostCreatedConsumer
 | Topic | Purpose |
 |-------|---------|
 | `post-created` | Main event stream |
-| `post-created-dlq` | Unprocessable or failed events |
+| `post-created-dlq` | Business-rule failures + exhausted retry failures |
 
-#### What’s done (Step 2a)
+#### What’s done (Step 2a — DLQ + Kafka)
 
 - [x] Kafka producer on post creation (`NotificationService` → `post-created`)
 - [x] Kafka consumer for fan-out (`PostCreatedConsumer`)
 - [x] Business-rule DLQ: `author == null` → `PostCreatedDeadLetter` on `post-created-dlq`
 - [x] `PostCreatedDeadLetter` DTO + `DeadLetterReason` enum
-- [x] README: Kafka setup, inspect topics/messages, delete topics
+- [x] README: Kafka setup, inspect topics/messages, delete topics, dev PostgreSQL (`psql`)
 
-#### Next up (recommended order)
+#### What’s done (Step 2b — Idempotency)
 
-**Step 2b — Idempotency** *(do before or with retry)*
+- [x] Unique DB constraint on `(recipient_id, reference_id, type)`
+- [x] `NotificationPersister` — per-insert `REQUIRES_NEW`, duplicate key treated as skip
+- [x] Reprocessing the same `PostCreatedEvent` does not create duplicate notification rows
+- [x] Fan-out is safe to run multiple times for the same event
+- [x] Test: `reprocessing same event does not create duplicate notifications`
 
-Problem: Kafka delivers at-least-once. If the consumer commits DB rows but crashes before acking the offset, redelivery creates **duplicate notifications**.
+#### What’s done (Step 2c — Retry + exception DLQ)
 
-```
-onPostCreated(event):
-  for user in otherUsers:
-    if notification already exists(recipient, referenceId, type):
-      skip
-    else:
-      persist notification
-```
+- [x] `quarkus-smallrye-fault-tolerance` dependency
+- [x] `@Retry(delay = 1000, maxRetries = 3)` + `@ExponentialBackoff(factor = 2)` on consumer
+- [x] `failure-strategy=dead-letter-queue` on `post-created-in` → `post-created-dlq`
+- [x] Transient errors retried with 1s → 2s → 4s backoff; exhausted failures nacked to DLQ
+- [x] Consumer comments document transient vs permanent vs idempotent paths
 
-Options:
-- Check-before-insert in consumer
-- Unique DB constraint on `(recipient_id, reference_id, type)` + handle duplicate gracefully
-
-Definition of done:
-- [ ] Reprocessing the same `PostCreatedEvent` does not create duplicate notification rows
-- [ ] Fan-out is safe to run multiple times for the same event
-
-**Step 2c — Retry with backoff**
-
-Problem: transient failures (DB down, connection timeout) should retry; permanent failures should not loop forever.
-
-```
-Message arrives → try process
-  → fail (exception)
-  → retry with backoff (e.g. 1s, 2s, 4s)
-  → still failing after N attempts
-  → send to DLQ (reason: e.g. PROCESSING_FAILED)
-  → ack and move on
-```
-
-Likely approach: SmallRye Kafka `failure-strategy` + retry config on `post-created-in` channel (separate from the explicit `author == null` DLQ path).
-
-Definition of done:
-- [ ] Transient DB errors are retried automatically (capped, with backoff)
-- [ ] After max retries, message lands in `post-created-dlq` with failure metadata
-- [ ] Consumer keeps processing subsequent messages (no poison-pill blocking)
-
-**Step 2d — Optional polish**
+#### Optional polish (Step 2d — deferred)
 
 - [ ] Expand `DeadLetterReason` (`PROCESSING_FAILED`, `MAX_RETRIES_EXCEEDED`, …)
-- [ ] DLQ inspection / replay notes in README
-- [ ] Tests for idempotency and retry paths
+- [ ] Unified DLQ payload for framework failures (today: raw `PostCreatedEvent` vs `PostCreatedDeadLetter`)
+- [ ] DLQ replay notes in README
 
-#### What you learn in Step 2
+#### What you learned in Step 2
 
 * At-least-once delivery and why idempotency matters
 * Retry vs skip vs DLQ (transient vs permanent vs business-rule failures)
 * Kafka topic patterns (main + DLQ)
-* Transaction boundaries in async consumers (`@Transactional` rolls back mid-loop failures, but not post-commit redelivery)
+* DB constraint as source of truth for idempotency
+* Framework retry/DLQ vs application-level DLQ
 
 ---
 
@@ -388,7 +367,8 @@ Definition of done:
 * REST API (Quarkus + Kotlin) ✅
 * PostgreSQL + Panache ✅
 * **Step 1:** In-app notifications on new post ✅
-* User notification preferences (opt out of NEW_POST)
+* **Step 2:** Consumer reliability (idempotency, retry, DLQ) ✅
+* User notification preferences (opt out of NEW_POST) ← *optional next*
 * Email notifications for new posts
 * Fake → real email provider
 
@@ -396,18 +376,19 @@ Definition of done:
 
 ### Level 2 (Intermediate)
 
-* Message queue (Kafka) ✅ started
+* Message queue (Kafka) ✅
 * Consumer in same app (`PostCreatedConsumer`) ✅
 * Business-rule DLQ (`author == null`) ✅
-* **Step 2b:** Idempotency ← *next*
-* **Step 2c:** Retry logic + exception DLQ
+* Idempotency (unique constraint + `NotificationPersister`) ✅
+* Retry + exponential backoff + framework DLQ ✅
 * Separate worker service (optional split later)
 * Docker setup ✅ (Kafka via `docker run`; see README)
 
 Architecture:
 ```
 API → DB → Kafka (post-created) → Consumer → notifications DB
-                                      └→ DLQ (post-created-dlq) on failure
+                                      ├→ DLQ (author missing, manual)
+                                      └→ DLQ (retries exhausted, framework)
 ```
 
 ---
@@ -416,7 +397,7 @@ API → DB → Kafka (post-created) → Consumer → notifications DB
 
 * OAuth2 authentication
 * Rate limiting
-* Idempotency keys (API-level; consumer dedup covered in Step 2b)
+* Idempotency keys (API-level; consumer dedup done in Step 2b ✅)
 * Kubernetes deployment
 * Monitoring & alerting (DLQ depth, consumer lag)
 * Distributed tracing
