@@ -62,6 +62,30 @@ class PostCreatedConsumerTest {
     }
 
     @Test
+    fun `reprocessing same event does not create duplicate notifications`() {
+        val alice = persistUser("alice", "alice@example.com")
+        persistUser("bob", "bob@example.com")
+        persistUser("carol", "carol@example.com")
+        val postId = UUID.randomUUID()
+        val event = PostCreatedEvent(
+            postId = postId,
+            authorId = alice.id,
+            authorUsername = alice.username,
+            title = "Hello world",
+            createdAt = Instant.now(),
+        )
+
+        consume(event)
+        consume(event)
+
+        inTransaction {
+            assertEquals(2, Notification.count())
+            assertEquals(1, Notification.count("recipient.username", "bob"))
+            assertEquals(1, Notification.count("recipient.username", "carol"))
+        }
+    }
+
+    @Test
     fun `skips fan-out when author not found`() {
         consume(
             PostCreatedEvent(

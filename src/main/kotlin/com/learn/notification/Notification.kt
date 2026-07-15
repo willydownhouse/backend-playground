@@ -13,12 +13,21 @@ import jakarta.persistence.Id
 import jakarta.persistence.JoinColumn
 import jakarta.persistence.ManyToOne
 import jakarta.persistence.Table
+import jakarta.persistence.UniqueConstraint
 import org.hibernate.annotations.CreationTimestamp
 import java.time.Instant
 import java.util.UUID
 
 @Entity
-@Table(name = "notifications")
+@Table(
+    name = "notifications",
+    uniqueConstraints = [
+        UniqueConstraint(
+            name = "uk_notification_recipient_reference_type",
+            columnNames = ["recipient_id", "reference_id", "type"],
+        ),
+    ],
+)
 class Notification : PanacheEntityBase {
 
     @Id
