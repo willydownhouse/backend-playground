@@ -3,8 +3,10 @@ package com.learn.notification
 import com.learn.post.PostCreatedEvent
 import com.learn.user.User
 import io.smallrye.common.annotation.Blocking
+import io.smallrye.faulttolerance.api.ExponentialBackoff
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.transaction.Transactional
+import org.eclipse.microprofile.faulttolerance.Retry
 import org.eclipse.microprofile.reactive.messaging.Channel
 import org.eclipse.microprofile.reactive.messaging.Emitter
 import org.eclipse.microprofile.reactive.messaging.Incoming
@@ -17,8 +19,10 @@ import java.time.Instant
  * Flow: post-created topic → fan-out notification rows to every user except the author.
  *
  * Kafka tracks progress per consumer group via offsets. If this method returns normally,
- * the offset is committed and the message won't be redelivered. If it throws, the offset
- * is not committed and Kafka may deliver the same message again (at-least-once delivery).
+ * the offset is committed and the message won't be redelivered.
+ *
+ * Transient failures (thrown exceptions) are retried via @Retry, then sent to post-created-dlq
+ * by the incoming channel failure-strategy when retries are exhausted.
  */
 @ApplicationScoped
 class PostCreatedConsumer(
@@ -29,9 +33,27 @@ class PostCreatedConsumer(
 
     private val log = Logger.getLogger(PostCreatedConsumer::class.java)
 
+    // --- Transient failure: infra errors (DB down, network timeout) ---
+    //
+    // Problem: something outside our control fails temporarily — the DB is unreachable,
+    // a connection times out, etc. The work might succeed if we try again in a few seconds.
+    //
+    // Wrong approaches:
+    //   - no retry → one blip loses the fan-out until Kafka redelivers (uncontrolled timing)
+    //   - retry forever → hammers a struggling DB, blocks the consumer on poison messages
+    //   - throw with failure-strategy=fail → stops the whole application
+    //
+    // Our approach: @Retry + @ExponentialBackoff, then failure-strategy=dead-letter-queue on the channel.
+    //   - @Retry: up to 3 retries; initial delay 1s, then 2s, then 4s (factor 2)
+    //   - still failing → message nacked → framework writes raw PostCreatedEvent to post-created-dlq
+    //   - idempotent fan-out (Step 2b) makes retries and redelivery safe (no duplicate rows)
+    //
+    // Note: author-missing is NOT retried — that path returns successfully after our manual DLQ.
     @Incoming("post-created-in")
     @Blocking // DB work runs on a worker thread, not the event loop
-    @Transactional // fan-out inserts succeed or roll back together; a thrown error rolls back all rows
+    @Retry(delay = 1000, maxRetries = 3)
+    @ExponentialBackoff(factor = 2, maxDelay = 10000)
+    @Transactional // wraps reads; each notification insert commits in its own REQUIRES_NEW transaction
     fun consume(event: PostCreatedEvent) {
         val author = User.findById(event.authorId)
 

@@ -39,7 +39,7 @@ docker run -d \
   -e KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
   -e KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=0@localhost:9093 \
   -e KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER \
-  bitnami/kafka
+  bitnami/kafka:3.3.2
 ```
 
 The app connects to **`localhost:9092`**.
@@ -125,6 +125,61 @@ You can run your application in dev mode that enables live coding using:
 ```
 
 > **_NOTE:_**  Quarkus now ships with a Dev UI, which is available in dev mode only at <http://localhost:8080/q/dev/>.
+
+### Connecting to PostgreSQL in dev mode
+
+In dev mode, Quarkus **Dev Services** starts a PostgreSQL container automatically. You do not configure the datasource yourself.
+
+When `./mvnw quarkus:dev` starts, look for a log line like:
+
+```text
+Container is started (JDBC URL: jdbc:postgresql://localhost:50136/quarkus?loggerLevel=OFF)
+```
+
+Use the **host**, **port**, and **database** from that URL. Dev Services defaults:
+
+| Setting | Value |
+|---------|-------|
+| Host | `localhost` |
+| Port | from the JDBC URL (changes per run) |
+| Database | `quarkus` |
+| User | `quarkus` |
+| Password | `quarkus` |
+
+Connect with `psql` (replace `50136` with your port from the logs):
+
+```shell script
+psql -h localhost -p 50136 -U quarkus -d quarkus
+```
+
+Or pass the password inline:
+
+```shell script
+PGPASSWORD=quarkus psql -h localhost -p 50136 -U quarkus -d quarkus
+```
+
+**Useful `psql` commands:**
+
+```sql
+-- list databases
+\l
+
+-- list tables in the current database
+\dt
+
+-- describe a table (columns, indexes, constraints)
+\d notifications
+
+-- run a query
+SELECT * FROM users;
+
+-- quit
+\q
+```
+
+This project's tables: `users`, `posts`, `notifications`.
+
+> **Note:** The dev database container only runs while `quarkus:dev` is up. The mapped port changes when Dev Services starts a new container — always check the JDBC URL in the startup logs.
 
 ## Packaging and running the application
 
